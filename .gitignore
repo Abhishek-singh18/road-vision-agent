@@ -1,0 +1,30 @@
+﻿.venv/
+__pycache__/
+*.py[cod]
+*.backup
+*.working-backup
+.env
+.streamlit/secrets.toml
+
+# Generated processing results
+data/input/*
+data/output/*
+data/live_session/*
+
+# Keep data directories available in Git
+!data/input/.gitkeep
+!data/output/.gitkeep
+!data/live_session/.gitkeep
+
+# Alternate and older dashboard backups
+live_dashboard_backup.py
+live_dashboard_old.py
+
+# Model weights are distributed separately
+yolo26n.pt
+
+# Generated media and temporary files
+*.mp4
+*.avi
+*.mov
+*.tmp
