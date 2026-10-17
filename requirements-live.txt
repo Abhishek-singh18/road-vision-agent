@@ -1,0 +1,9 @@
+streamlit
+streamlit-webrtc
+av
+opencv-python-headless
+pandas
+plotly
+torch
+ultralytics
+imageio-ffmpeg
