@@ -1,9 +1,9 @@
-streamlit
-streamlit-webrtc
+streamlit==1.65.0
+streamlit-webrtc==0.78.1
 av
 opencv-python-headless
 pandas
 plotly
 torch
-ultralytics
+ultralytics==8.4.174
 imageio-ffmpeg
