@@ -1,21 +1,34 @@
 
 from pathlib import Path
+import logging
+import os
 import re
+import secrets
 import subprocess
 import uuid
 
 import imageio_ffmpeg
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    UploadFile,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
 from src.track_vehicles import analyze_video
 
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = FastAPI(
     title="Road Vision Agent API",
     description="Vehicle detection and traffic-crossing analysis",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,8 +36,44 @@ INPUT_DIR = ROOT / "data" / "input"
 OUTPUT_DIR = ROOT / "data" / "output"
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov"}
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
+JOB_ID_PATTERN = re.compile(r"[a-f0-9]{12}")
 
+
+# ---------------------------------------------------------
+# API KEY AUTHENTICATION
+# ---------------------------------------------------------
+
+def verify_api_key(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> bool:
+    """Require a valid API key for protected endpoints."""
+
+    expected_key = os.getenv("ROAD_VISION_API_KEY")
+
+    if not expected_key:
+        logger.error("ROAD_VISION_API_KEY is not configured.")
+        raise HTTPException(
+            status_code=503,
+            detail="API authentication is not configured.",
+        )
+
+    if not x_api_key or not secrets.compare_digest(
+        x_api_key,
+        expected_key,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    return True
+
+
+# ---------------------------------------------------------
+# PUBLIC ENDPOINTS
+# ---------------------------------------------------------
 
 @app.get("/")
 def home():
@@ -40,8 +89,13 @@ def health():
     return {"status": "healthy"}
 
 
-def convert_to_h264(input_path: Path, output_path: Path):
+# ---------------------------------------------------------
+# VIDEO CONVERSION
+# ---------------------------------------------------------
+
+def convert_to_h264(input_path: Path, output_path: Path) -> None:
     """Convert the annotated video to browser-compatible H.264 MP4."""
+
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 
     command = [
@@ -62,20 +116,32 @@ def convert_to_h264(input_path: Path, output_path: Path):
         capture_output=True,
         text=True,
         timeout=1800,
+        check=False,
     )
 
     if completed.returncode != 0 or not output_path.is_file():
-        raise RuntimeError(
-            f"FFmpeg conversion failed: {completed.stderr[-2000:]}"
+        # Keep detailed FFmpeg output in server logs, not API responses.
+        logger.error(
+            "FFmpeg conversion failed: %s",
+            completed.stderr[-2000:],
         )
+        raise RuntimeError("Video conversion failed.")
 
+
+# ---------------------------------------------------------
+# PROTECTED VIDEO ANALYSIS ENDPOINT
+# ---------------------------------------------------------
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
+async def analyze(
+    file: UploadFile = File(...),
+    _: bool = Depends(verify_api_key),
+):
     original_filename = file.filename or "uploaded_video.mp4"
     extension = Path(original_filename).suffix.lower()
 
     if extension not in VIDEO_EXTENSIONS:
+        await file.close()
         raise HTTPException(
             status_code=400,
             detail="Upload a video in MP4, AVI, or MOV format.",
@@ -85,6 +151,7 @@ async def analyze(file: UploadFile = File(...)):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     job_id = uuid.uuid4().hex[:12]
+
     input_path = INPUT_DIR / f"{job_id}{extension}"
     raw_video_path = OUTPUT_DIR / f"{job_id}_raw.mp4"
     video_path = OUTPUT_DIR / f"{job_id}_tracked.mp4"
@@ -92,14 +159,17 @@ async def analyze(file: UploadFile = File(...)):
 
     size = 0
 
+    # Save the uploaded file in chunks to enforce the size limit.
     try:
         with input_path.open("wb") as destination:
             while True:
                 chunk = await file.read(1024 * 1024)
+
                 if not chunk:
                     break
 
                 size += len(chunk)
+
                 if size > MAX_UPLOAD_SIZE:
                     raise HTTPException(
                         status_code=413,
@@ -111,15 +181,20 @@ async def analyze(file: UploadFile = File(...)):
     except HTTPException:
         input_path.unlink(missing_ok=True)
         raise
+
     except Exception as exc:
+        logger.exception("Could not save uploaded video.")
         input_path.unlink(missing_ok=True)
+
         raise HTTPException(
             status_code=500,
             detail="Could not save the uploaded video.",
         ) from exc
+
     finally:
         await file.close()
 
+    # Analyze the video and convert the annotated result.
     try:
         result = await run_in_threadpool(
             analyze_video,
@@ -154,23 +229,34 @@ async def analyze(file: UploadFile = File(...)):
         }
 
     except Exception as exc:
+        logger.exception("Video analysis or conversion failed.")
+
+        # Remove incomplete output files after a failed job.
         raw_video_path.unlink(missing_ok=True)
         video_path.unlink(missing_ok=True)
         csv_path.unlink(missing_ok=True)
 
         raise HTTPException(
             status_code=500,
-            detail=f"Video analysis or conversion failed: {str(exc)}",
+            detail="Video analysis or conversion failed. Check server logs.",
         ) from exc
 
     finally:
-        # The uploaded source is no longer needed after analysis.
+        # The original upload is no longer needed after processing.
         input_path.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------
+# PROTECTED RESULT DOWNLOAD ENDPOINT
+# ---------------------------------------------------------
+
 @app.get("/files/{job_id}/{kind}")
-def download_result(job_id: str, kind: str):
-    if not re.fullmatch(r"[a-f0-9]{12}", job_id):
+def download_result(
+    job_id: str,
+    kind: str,
+    _: bool = Depends(verify_api_key),
+):
+    if not JOB_ID_PATTERN.fullmatch(job_id):
         raise HTTPException(
             status_code=400,
             detail="Invalid job ID.",
@@ -179,9 +265,11 @@ def download_result(job_id: str, kind: str):
     if kind == "video":
         path = OUTPUT_DIR / f"{job_id}_tracked.mp4"
         media_type = "video/mp4"
+
     elif kind == "csv":
         path = OUTPUT_DIR / f"{job_id}_crossings.csv"
         media_type = "text/csv"
+
     else:
         raise HTTPException(
             status_code=400,
@@ -195,11 +283,15 @@ def download_result(job_id: str, kind: str):
         )
 
     return FileResponse(
-        path,
+        path=path,
         media_type=media_type,
         filename=path.name,
     )
 
+
+# ---------------------------------------------------------
+# LOCAL DEVELOPMENT ENTRY POINT
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
