@@ -59,4 +59,3 @@ websockets==17.2
 streamlit==1.65.0
 streamlit-webrtc==0.78.1
 pandas
-lap
